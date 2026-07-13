@@ -1,0 +1,4 @@
+interface:
+  display_name: "网页资料转 Skill 母版"
+  short_description: "把抓取后的网页 HTML 快照组装成专用 skill。"
+  default_prompt: "使用 $web-to-skill 抓取网页、保存渲染后的 HTML 快照，并生成可按索引和 HTML 文档检索的专用 skill。"
