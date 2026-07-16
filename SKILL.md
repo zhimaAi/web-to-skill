@@ -1,6 +1,6 @@
 ---
 name: web-to-skill
-description: "Convert one public website URL or an explicit batch of public URLs into a reusable skill zip backed by rendered HTML snapshots and a bounded JSONL retrieval index. Use when Codex needs to discover a documentation directory from one URL, crawl a supplied URL set sequentially, generate a source profile, or package indexed web content as a specialized skill."
+description: "Convert one public website URL or an explicit batch of public URLs into a reusable skill zip backed by rendered HTML snapshots and a bounded JSONL retrieval index. Use to discover a documentation directory from one URL, crawl a supplied URL set sequentially, generate a source profile, or package indexed web content as a specialized skill."
 ---
 
 # Web To Skill
