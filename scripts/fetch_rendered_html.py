@@ -8,6 +8,7 @@ import ipaddress
 import os
 import socket
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,9 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 DEFAULT_DNS_TIMEOUT_MS = 1000
+DEFAULT_DNS_CACHE_TTL_MS = 60000
+DEFAULT_TIMEOUT_MS = 30000
+DEFAULT_WAIT_MS = 1000
 
 
 class URLSafetyError(RuntimeError):
@@ -46,10 +50,19 @@ def _blocked_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> 
 
 
 class URLSafetyGuard:
-    def __init__(self, dns_timeout_ms: int = DEFAULT_DNS_TIMEOUT_MS) -> None:
+    def __init__(
+        self,
+        dns_timeout_ms: int = DEFAULT_DNS_TIMEOUT_MS,
+        dns_cache_ttl_ms: int = DEFAULT_DNS_CACHE_TTL_MS,
+    ) -> None:
         if dns_timeout_ms <= 0:
             raise ValueError("dns_timeout_ms must be positive")
+        if dns_cache_ttl_ms <= 0:
+            raise ValueError("dns_cache_ttl_ms must be positive")
         self.dns_timeout = dns_timeout_ms / 1000
+        self.dns_cache_ttl = dns_cache_ttl_ms / 1000
+        self._dns_cache: dict[tuple[str, int], tuple[float, tuple[str, ...]]] = {}
+        self._dns_inflight: dict[tuple[str, int], asyncio.Task[tuple[str, ...]]] = {}
 
     async def validate(self, raw_url: str) -> str:
         parsed = urlparse(raw_url)
@@ -81,6 +94,32 @@ class URLSafetyGuard:
         except ValueError:
             pass
 
+        key = (host.rstrip(".").lower(), port)
+        now = time.monotonic()
+        cached = self._dns_cache.get(key)
+        if cached is not None:
+            expires_at, addresses = cached
+            if expires_at > now:
+                return addresses
+            self._dns_cache.pop(key, None)
+
+        task = self._dns_inflight.get(key)
+        if task is None:
+            task = asyncio.create_task(self._resolve_uncached(host, port))
+            self._dns_inflight[key] = task
+
+            def clear_inflight(completed: asyncio.Task[tuple[str, ...]]) -> None:
+                if self._dns_inflight.get(key) is completed:
+                    self._dns_inflight.pop(key, None)
+
+            task.add_done_callback(clear_inflight)
+
+        addresses = await asyncio.shield(task)
+        self._dns_cache[key] = (time.monotonic() + self.dns_cache_ttl, addresses)
+        return addresses
+
+    async def _resolve_uncached(self, host: str, port: int) -> tuple[str, ...]:
+
         loop = asyncio.get_running_loop()
         try:
             infos = await asyncio.wait_for(
@@ -102,20 +141,38 @@ class URLSafetyGuard:
 class DomainRule:
     domains: tuple[str, ...]
     body_selector: str
+    match_path_prefixes: tuple[str, ...] = ()
 
 
 DOMAIN_RULES = (
+    DomainRule(
+        domains=("help.chatwiki.com",),
+        body_selector="article.theme-doc-markdown, .theme-doc-markdown, main article",
+    ),
     DomainRule(
         domains=("www.yuque.com",),
         body_selector="article.article-content",
     ),
     DomainRule(
-        domains=("my.feishu.cn",),
+        domains=("feishu.cn",),
         body_selector=".docx-page-main, .wiki-doc-content, .suite-docx, main",
+        match_path_prefixes=("/wiki/", "/docx/"),
     ),
     DomainRule(
         domains=("docs.openclaw.ai",),
         body_selector="article.article, main article",
+    ),
+    DomainRule(
+        domains=("help.aliyun.com",),
+        body_selector="#pc-markdown-container .markdown-body, main.aliyun-docs-view",
+    ),
+    DomainRule(
+        domains=("kancloud.cn",),
+        body_selector=".content",
+    ),
+    DomainRule(
+        domains=("mp.weixin.qq.com",),
+        body_selector="#js_content, .rich_media_content",
     ),
 )
 
@@ -130,11 +187,16 @@ def normalize_domain(domain: str) -> str:
 
 
 def rule_for_url(raw_url: str) -> DomainRule | None:
-    host = (urlparse(raw_url).hostname or "").lower()
+    parsed = urlparse(raw_url)
+    host = (parsed.hostname or "").lower()
     for rule in DOMAIN_RULES:
         for domain in rule.domains:
             domain_host = normalize_domain(domain)
-            if host == domain_host or host.endswith("." + domain_host):
+            domain_matches = host == domain_host or host.endswith("." + domain_host)
+            path_matches = not rule.match_path_prefixes or any(
+                parsed.path.startswith(prefix) for prefix in rule.match_path_prefixes
+            )
+            if domain_matches and path_matches:
                 return rule
     return None
 
@@ -163,8 +225,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("url", help="URL to fetch.")
     parser.add_argument("--out", help=argparse.SUPPRESS)
-    parser.add_argument("--timeout-ms", default=120000, type=positive_int, help="Navigation timeout.")
-    parser.add_argument("--wait-ms", default=1000, type=nonnegative_int, help="Extra wait before capturing HTML.")
+    parser.add_argument("--timeout-ms", default=DEFAULT_TIMEOUT_MS, type=positive_int, help="Navigation timeout.")
+    parser.add_argument("--wait-ms", default=DEFAULT_WAIT_MS, type=nonnegative_int, help="Extra wait before capturing HTML.")
     parser.add_argument("--selector", help="Optional CSS selector to wait for before capturing HTML.")
     parser.add_argument("--dns-timeout-ms", default=DEFAULT_DNS_TIMEOUT_MS, type=positive_int, help=argparse.SUPPRESS)
     return parser.parse_args()
@@ -218,6 +280,27 @@ def clean_body_text(value: str) -> str:
     value = value.replace("\r\n", "\n").replace("\r", "\n")
     lines = [collapse_space(line) for line in value.split("\n")]
     return "\n".join(line for line in lines if line)
+
+
+def ensure_nonempty_rendered_body(body_text: str) -> None:
+    if not clean_body_text(body_text):
+        raise RuntimeError(
+            "rendered body is empty after page load; the page scripts or content may have failed to load"
+        )
+
+
+def select_first_body_nodes_soup(soup: Any, selector_group: str) -> list[Any]:
+    """Return nodes from the first selector that matches, treating commas as priority fallbacks."""
+    for selector in (item.strip() for item in selector_group.split(",")):
+        if not selector:
+            continue
+        try:
+            nodes = list(soup.select(selector))
+        except Exception:
+            continue
+        if nodes:
+            return nodes
+    return []
 
 
 def split_keywords(raw: str) -> list[str]:
@@ -391,7 +474,7 @@ def rendered_html_snapshot(
     keywords = split_keywords(meta_content_soup(head, "name", "keywords")) or fallback_keywords
 
     rule = rule_for_url(final_url)
-    body_nodes = soup.select(rule.body_selector) if rule and rule.body_selector else []
+    body_nodes = select_first_body_nodes_soup(soup, rule.body_selector) if rule and rule.body_selector else []
     matched_rule_body = bool(body_nodes)
     if not body_nodes:
         body_nodes = [soup.body or soup]
@@ -469,6 +552,7 @@ async def fetch_rendered_html(args: argparse.Namespace) -> tuple[str, str]:
             final_url = page.url
             await url_guard.validate(final_url)
             browser_body_text = await read_body_text(page)
+            ensure_nonempty_rendered_body(browser_body_text)
             title, description, keywords = await read_page_metadata(page)
             html_text = await page.content()
             return final_url, rendered_html_snapshot(html_text, final_url, browser_body_text, title, description, keywords)
